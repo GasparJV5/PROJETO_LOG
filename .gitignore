@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
+
+# Arquivos sensíveis de entrada
+entrada/xml/*
+entrada/oc/*
+
+# Manter estrutura das pastas de entrada
+!entrada/xml/.gitkeep
+!entrada/oc/.gitkeep
+
+# Resultados gerados
+resultado/*
+!resultado/.gitkeep
+
+# Saída processada
+saida/*
+!saida/.gitkeep
+
+# Debugs e conversões temporárias
+debug_*.txt
+*_debug*.txt
+resultado/debug_*.txt
+resultado/_convertido_*.txt
+resultado/*.txt
+
+# Arquivos fiscais/documentais sensíveis
+*.xml
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.csv
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
