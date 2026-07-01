@@ -11,6 +11,11 @@ PASTA_OC = BASE_DIR / "entrada" / "oc"
 PASTA_RESULTADO = BASE_DIR / "resultado"
 ARQUIVO_PROGRAMACAO = PASTA_RESULTADO / "programacao_recebimento.csv"
 
+# Status oficiais gerados pelo motor (main.py). O painel antigo filtrava
+# por "ERRO", que nunca é gerado pelo motor (ele gera OK/EMPRESTIMO/
+# RECUSADA) — o filtro nunca funcionava. Corrigido aqui.
+STATUS_VALIDOS = ["OK", "EMPRESTIMO", "RECUSADA"]
+
 
 def garantir_pastas():
     PASTA_XML.mkdir(parents=True, exist_ok=True)
@@ -24,7 +29,6 @@ def salvar_upload(uploaded_file, destino: Path):
         f.write(uploaded_file.getbuffer())
 
 
-
 def executar_motor():
     comando = [sys.executable, str(BASE_DIR / "main.py")]
     return subprocess.run(
@@ -35,7 +39,6 @@ def executar_motor():
         errors="replace",
         cwd=str(BASE_DIR)
     )
-
 
 
 def carregar_programacao(data_programada=None):
@@ -66,6 +69,8 @@ def carregar_programacao(data_programada=None):
         if col not in df.columns:
             df[col] = default
 
+    df["status"] = df["status"].astype(str).str.upper().str.strip()
+
     if data_programada is not None:
         data_str = data_programada.strftime("%d/%m/%Y") if hasattr(data_programada, "strftime") else str(data_programada)
         vazios = df["data_programada"].astype(str).str.strip().isin(["", "nan", "None"])
@@ -75,24 +80,53 @@ def carregar_programacao(data_programada=None):
     return df
 
 
+def carregar_detalhe_itens():
+    caminho = PASTA_RESULTADO / "conferencia_itens.csv"
+    if not caminho.exists():
+        return pd.DataFrame()
+    return pd.read_csv(caminho, sep=";")
+
+
 def formatar_moeda(valor):
     try:
         valor = float(valor)
-    except:
+    except Exception:
         valor = 0.0
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def mostrar_cards(df: pd.DataFrame):
+def render_card(row, df_itens_detalhe):
+    with st.container(border=True):
+        st.markdown(f"**NF:** {row.get('numero_nota', '')}  |  **Fornecedor:** {row.get('fornecedor', '')}")
+        st.markdown(f"**OC:** {row.get('numero_oc', '') or '—'}  |  **Doc. Origem:** {row.get('doc_origem', '') or '—'}")
+        st.markdown(f"**Itens:** {row.get('qtd_itens', 0)} (OK: {row.get('itens_ok', 0)} / Erro: {row.get('itens_erro', 0)})")
+        st.markdown(f"**Valor Total:** {formatar_moeda(row.get('valor_total', 0))}")
+        if str(row.get("motivo", "")).strip() not in ["", "nan"]:
+            st.markdown(f"**Motivo:** {row.get('motivo', '')}")
+        st.caption(f"Cabeçalho: {row.get('status_cabecalho', '')} | Itens: {row.get('status_itens', '')} | Responsável: {row.get('responsavel', '')}")
+
+        if not df_itens_detalhe.empty:
+            detalhe_nf = df_itens_detalhe[df_itens_detalhe["numero_nota"].astype(str) == str(row.get("numero_nota", ""))]
+            if not detalhe_nf.empty:
+                with st.expander("Ver comparação item a item"):
+                    colunas = [c for c in [
+                        "codigo_item_xml", "descricao_item_xml", "status_item", "motivo_item",
+                        "metodo_match", "score_match", "quantidade_item_xml", "quantidade_item_oc",
+                        "valor_unitario_item_xml", "valor_unitario_item_oc",
+                    ] if c in detalhe_nf.columns]
+                    st.dataframe(detalhe_nf[colunas], use_container_width=True, hide_index=True)
+
+
+def mostrar_cards(df: pd.DataFrame, df_itens_detalhe: pd.DataFrame):
     if df.empty:
         st.info("Nenhum resultado disponível ainda.")
         return
 
     st.subheader("Painel de Recebimento")
 
-    status_filtro = st.selectbox("Filtrar status", ["TODOS", "OK", "ERRO"], index=0)
+    status_filtro = st.selectbox("Filtrar status", ["TODOS"] + STATUS_VALIDOS, index=0)
     if status_filtro != "TODOS":
-        df = df[df["status"].astype(str).str.upper() == status_filtro]
+        df = df[df["status"] == status_filtro]
 
     if df.empty:
         st.warning("Nenhum card para o filtro selecionado.")
@@ -104,40 +138,34 @@ def mostrar_cards(df: pd.DataFrame):
         data_prog = data_prog if str(data_prog).strip() not in ["", "nan", "None"] else "Sem Data"
         st.markdown(f"## {data_prog}")
 
-        col1, col2 = st.columns(2)
-        ok = grupo[grupo["status"].astype(str).str.upper() == "OK"]
-        erro = grupo[grupo["status"].astype(str).str.upper() == "ERRO"]
+        col_ok, col_emprestimo, col_recusada = st.columns(3)
 
-        with col1:
-            st.markdown("### OK")
-            if ok.empty:
+        with col_ok:
+            st.markdown("### ✅ OK")
+            grupo_ok = grupo[grupo["status"] == "OK"]
+            if grupo_ok.empty:
                 st.write("Nenhum card OK")
             else:
-                for _, row in ok.iterrows():
-                    with st.container(border=True):
-                        st.markdown(f"**NF:** {row.get('numero_nota', '')}")
-                        st.markdown(f"**Fornecedor:** {row.get('fornecedor', '')}")
-                        st.markdown(f"**OC:** {row.get('numero_oc', '')}")
-                        st.markdown(f"**Doc. Origem:** {row.get('doc_origem', '')}")
-                        st.markdown(f"**Qtd Itens:** {row.get('qtd_itens', 0)}")
-                        st.markdown(f"**Valor Total:** {formatar_moeda(row.get('valor_total', 0))}")
-                        st.caption(f"Responsável: {row.get('responsavel', '')}")
+                for _, row in grupo_ok.iterrows():
+                    render_card(row, df_itens_detalhe)
 
-        with col2:
-            st.markdown("### ERRO")
-            if erro.empty:
-                st.write("Nenhum card com erro")
+        with col_emprestimo:
+            st.markdown("### ⚠️ Empréstimo (divergência)")
+            grupo_emp = grupo[grupo["status"] == "EMPRESTIMO"]
+            if grupo_emp.empty:
+                st.write("Nenhum card em empréstimo")
             else:
-                for _, row in erro.iterrows():
-                    with st.expander(f"NF {row.get('numero_nota', '')} | {row.get('fornecedor', '')}"):
-                        st.markdown(f"**OC:** {row.get('numero_oc', '')}")
-                        st.markdown(f"**Doc. Origem:** {row.get('doc_origem', '')}")
-                        st.markdown(f"**Qtd Itens:** {row.get('qtd_itens', 0)}")
-                        st.markdown(f"**Valor Total:** {formatar_moeda(row.get('valor_total', 0))}")
-                        st.markdown(f"**Status Cabeçalho:** {row.get('status_cabecalho', '')}")
-                        st.markdown(f"**Status Itens:** {row.get('status_itens', '')}")
-                        st.markdown(f"**Motivo:** {row.get('motivo', '')}")
-                        st.caption(f"Responsável: {row.get('responsavel', '')}")
+                for _, row in grupo_emp.iterrows():
+                    render_card(row, df_itens_detalhe)
+
+        with col_recusada:
+            st.markdown("### ❌ Recusada")
+            grupo_rec = grupo[grupo["status"] == "RECUSADA"]
+            if grupo_rec.empty:
+                st.write("Nenhuma nota recusada")
+            else:
+                for _, row in grupo_rec.iterrows():
+                    render_card(row, df_itens_detalhe)
 
 
 def main():
@@ -195,12 +223,14 @@ def main():
                 st.code(resultado.stdout)
 
         df = carregar_programacao(data_programada)
-        mostrar_cards(df)
+        df_itens_detalhe = carregar_detalhe_itens()
+        mostrar_cards(df, df_itens_detalhe)
 
     else:
         st.subheader("2) Cards já processados")
         df = carregar_programacao()
-        mostrar_cards(df)
+        df_itens_detalhe = carregar_detalhe_itens()
+        mostrar_cards(df, df_itens_detalhe)
 
 
 if __name__ == "__main__":

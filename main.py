@@ -1,5 +1,36 @@
+"""
+Motor de Planejamento de Recebimento
+=====================================
+Compara NF-e (XML) com Ordem de Compra (DOC/TXT/CSV) e classifica cada
+nota em OK / EMPRESTIMO / RECUSADA, seguindo a lógica de reconciliação
+descrita na especificação do sistema.
+
+Principais melhorias desta revisão (foco em comparação de itens):
+- Normalização de texto corrigida (acentos deixavam de ser removidos
+  corretamente e quebravam palavras, ex.: "ATENÇÃO" -> "ATENO").
+- Casamento de itens XML x OC reescrito para buscar, em cada etapa de
+  prioridade, o MELHOR candidato entre TODOS os itens da OC (antes o
+  código verificava as 5 regras por linha da OC, na ordem da planilha,
+  o que podia casar um item errado só porque veio primeiro na lista).
+- Match por descrição agora usa um score contínuo (similaridade de
+  tokens relevantes + similaridade de sequência), com stopwords de
+  itens (UN, CX, PARA, DE...) e limiar mínimo, reduzindo falso-positivo
+  e falso-negativo.
+- Fator de embalagem (2X8, 10X50...) deixou de SOBRESCREVER a
+  quantidade fiscal do XML (isso podia distorcer a quantidade real);
+  agora é apenas informativo e cruzado com o valor do item.
+- Validação de consistência de cálculo do item (qtd x valor unitário
+  ~= valor total) e de unidade divergente, previstas na especificação
+  e que não existiam na versão anterior.
+- Correção de bug de classificação: quando a NF não tem OC vinculada,
+  a nota agora é corretamente lançada como RECUSADA na programação de
+  recebimento (antes esse caso não gerava nenhuma linha de saída).
+"""
+
 import re
 import sys
+import unicodedata
+from difflib import SequenceMatcher
 from pathlib import Path
 from datetime import datetime, timedelta
 import pandas as pd
@@ -21,30 +52,113 @@ PASTA_RESULTADO = BASE_DIR / "resultado"
 ARQUIVO_RESULTADO = PASTA_RESULTADO / "resultado.xlsx"
 NS = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
 
+TOL_QTD = 0.01
+TOL_VALOR = 0.05
+
+# Limiar mínimo de similaridade para aceitar um match por descrição
+# inteligente (0 a 1). Abaixo disso o item é considerado não encontrado.
+LIMIAR_SIMILARIDADE_DESC = 0.45
+MIN_TOKENS_COMUNS = 2
+
+# Palavras que aparecem com frequência em descrições de item e que,
+# sozinhas, não indicam que dois itens são o mesmo produto.
+STOPWORDS_DESC = {
+    "DE", "DA", "DO", "DOS", "DAS", "PARA", "COM", "SEM", "E", "OU",
+    "UN", "UND", "UNIDADE", "UNID", "EMB", "EMBALAGEM", "CX", "CAIXA",
+    "PCT", "PC", "PCS", "KIT", "REF", "MOD", "MODELO", "TIPO", "COR",
+    "N", "NO", "NA", "A", "O",
+}
+
+ALIASES_UNIDADE = {
+    "UN": "UN", "UND": "UN", "UNID": "UN", "UNIDADE": "UN",
+    "PC": "PC", "PCT": "PCT", "PCS": "PC",
+    "CX": "CX", "CAIXA": "CX",
+    "KG": "KG", "KGS": "KG",
+    "G": "G", "GR": "G", "GRAMA": "G",
+    "L": "L", "LT": "L", "LITRO": "L",
+    "ML": "ML",
+    "M": "M", "MT": "M", "METRO": "M",
+    "FR": "FR", "FRASCO": "FR",
+    "AMP": "AMP", "AMPOLA": "AMP",
+    "CP": "CP", "CPR": "CP", "COMPRIMIDO": "CP",
+    "CJ": "CJ", "CONJUNTO": "CJ",
+    "PAR": "PAR",
+    "RL": "RL", "ROLO": "RL",
+}
+
 # =========================================================
-# UTILITÁRIOS
+# UTILITÁRIOS DE TEXTO
 # =========================================================
 def garantir_pastas():
+    PASTA_XML.mkdir(parents=True, exist_ok=True)
+    PASTA_OC.mkdir(parents=True, exist_ok=True)
     PASTA_RESULTADO.mkdir(parents=True, exist_ok=True)
+
 
 def arquivo_vazio(caminho: Path) -> bool:
     return (not caminho.exists()) or caminho.stat().st_size == 0
 
+
 def normalize_spaces(texto: str) -> str:
     return re.sub(r"\s+", " ", str(texto or "")).strip()
 
+
+def remover_acentos(texto: str) -> str:
+    """Remove acentuação preservando a letra base (Á -> A, Ç -> C...).
+
+    A versão anterior removia o caractere acentuado inteiro via regex,
+    o que fragmentava palavras (ex.: 'ATENÇÃO' virava 'ATENO') e
+    prejudicava comparações de nome de cliente/fornecedor e descrição
+    de item.
+    """
+    texto = str(texto or "")
+    nfkd = unicodedata.normalize("NFKD", texto)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
 def normalizar_texto(texto: str) -> str:
-    texto = normalize_spaces(texto).upper()
+    """Normalização genérica (nomes, cliente, fornecedor, endereço)."""
+    texto = remover_acentos(normalize_spaces(texto)).upper()
     texto = re.sub(r"[^A-Z0-9 ]", "", texto)
     texto = re.sub(r"\s+", " ", texto).strip()
     return texto
 
+
+def normalizar_desc(desc: str) -> str:
+    """Normalização de descrição de item, preservando separação de
+    palavras (hífen vira espaço, não é apenas removido)."""
+    texto = remover_acentos(normalize_spaces(desc)).upper()
+    texto = texto.replace("-", " ")
+    texto = re.sub(r"[^A-Z0-9 ]", " ", texto)
+    texto = re.sub(r"\s+", " ", texto).strip()
+    return texto
+
+
+def normalizar_codigo(codigo: str) -> str:
+    """Normalização de código de item: remove hífen, espaço e símbolo,
+    mantendo apenas letras e números colados (MA05-MP -> MA05MP)."""
+    texto = remover_acentos(str(codigo or "")).upper()
+    texto = re.sub(r"[^A-Z0-9]", "", texto)
+    return texto
+
+
+def normalizar_unidade(unidade: str) -> str:
+    chave = normalizar_codigo(unidade)
+    return ALIASES_UNIDADE.get(chave, chave)
+
+
 def limpar_cnpj(texto: str) -> str:
     return re.sub(r"\D", "", str(texto or ""))
 
+
 def raiz_cnpj(cnpj: str) -> str:
-    c = limpar_cnpj(cnpj)
-    return c[:8] if len(c) >= 8 else c
+    cnpj_limpo = limpar_cnpj(cnpj)
+    return cnpj_limpo[:8] if len(cnpj_limpo) >= 8 else cnpj_limpo
+
+
+def so_numeros(texto: str) -> str:
+    return re.sub(r"\D", "", str(texto or ""))
+
 
 def numero(valor, default=0.0):
     try:
@@ -52,11 +166,9 @@ def numero(valor, default=0.0):
             return default
         if isinstance(valor, (int, float)):
             return float(valor)
-
         s = str(valor).strip().replace("R$", "")
         if not s:
             return default
-
         if "," in s and "." in s:
             if s.rfind(",") > s.rfind("."):
                 s = s.replace(".", "").replace(",", ".")
@@ -64,21 +176,19 @@ def numero(valor, default=0.0):
                 s = s.replace(",", "")
         else:
             s = s.replace(",", ".")
-
         return float(s)
     except Exception:
         return default
+
 
 def parse_data(valor):
     if valor is None:
         return None
     if isinstance(valor, datetime):
         return valor
-
     s = str(valor).strip()
     if not s:
         return None
-
     for fmt in (
         "%Y-%m-%dT%H:%M:%S%z",
         "%Y-%m-%dT%H:%M:%S",
@@ -91,18 +201,18 @@ def parse_data(valor):
             return datetime.strptime(s, fmt)
         except Exception:
             pass
-
     m = re.match(r"^(\d{4}-\d{2}-\d{2})", s)
     if m:
         try:
             return datetime.strptime(m.group(1), "%Y-%m-%d")
         except Exception:
             pass
-
     return None
+
 
 def data_str(dt: datetime) -> str:
     return dt.strftime("%d/%m/%Y") if isinstance(dt, datetime) else ""
+
 
 def comparar_texto_simples(a: str, b: str) -> bool:
     na = normalizar_texto(a)
@@ -111,30 +221,28 @@ def comparar_texto_simples(a: str, b: str) -> bool:
         return False
     return na == nb or na in nb or nb in na
 
+
 def comparar_nome_fornecedor(a: str, b: str) -> bool:
     na = normalizar_texto(a)
     nb = normalizar_texto(b)
     if not na or not nb:
         return False
-
-    # aliases simples para reduzir falso negativo no caso MEDERI x MDR
-    aliases = [
-        ("MDR", "MEDERI"),
-    ]
+    aliases = [("MDR", "MEDERI")]
     for x, y in aliases:
         na = na.replace(x, y)
         nb = nb.replace(x, y)
-
     return na == nb or na in nb or nb in na
+
 
 def normalizar_mod_frete(codigo):
     mapa = {
         "0": "Por conta do emitente",
-        "1": "Por conta do destinatário/remetente",
+        "1": "Por conta do destinatario/remetente",
         "2": "Por conta de terceiros",
         "9": "Sem frete",
     }
     return mapa.get(str(codigo), str(codigo or ""))
+
 
 def texto_xml(elem, xpath, default=""):
     try:
@@ -143,17 +251,17 @@ def texto_xml(elem, xpath, default=""):
     except Exception:
         return default
 
+
 def buscar_regex(texto: str, padrao: str, grupo=1, flags=re.I | re.S, default=""):
     m = re.search(padrao, texto, flags=flags)
     return normalize_spaces(m.group(grupo)) if m else default
 
 # =========================================================
-# DOC ORIGEM NA NF
+# XML NF-e
 # =========================================================
 def extrair_doc_origem_da_obs(observacao: str) -> str:
     if not observacao:
         return ""
-
     padroes = [
         r"Doc\.?\s*Origem\s*[:\-]?\s*([0-9]+)",
         r"Doc\.?\s*Orig\.?\s*[:\-]?\s*([0-9]+)",
@@ -162,25 +270,21 @@ def extrair_doc_origem_da_obs(observacao: str) -> str:
         r"N[ºo]?\s*OC\s*[:\-]?\s*([0-9]+)",
         r"Pedido\s*[:\-]?\s*([0-9]+)",
     ]
-
     for p in padroes:
         m = re.search(p, observacao, flags=re.IGNORECASE)
         if m:
             return m.group(1)
     return ""
 
-# =========================================================
-# XML NF-e
-# =========================================================
+
 def extrair_xml(caminho_xml: Path):
     if arquivo_vazio(caminho_xml):
         raise ValueError("Arquivo XML vazio ou inexistente")
-
     try:
         tree = ET.parse(caminho_xml)
         root = tree.getroot()
     except ET.ParseError as e:
-        raise ValueError(f"Arquivo XML inválido: {e}")
+        raise ValueError(f"Arquivo XML invalido: {e}")
 
     numero_nota = texto_xml(root, ".//nfe:ide/nfe:nNF")
     natureza_operacao = texto_xml(root, ".//nfe:ide/nfe:natOp")
@@ -209,8 +313,6 @@ def extrair_xml(caminho_xml: Path):
 
     observacao_nota = texto_xml(root, ".//nfe:infAdic/nfe:infCpl")
     doc_origem_encontrado_xml = extrair_doc_origem_da_obs(observacao_nota)
-
-    # compra/xPed é importantíssimo no teu cenário
     xped = texto_xml(root, ".//nfe:compra/nfe:xPed")
     if xped and not doc_origem_encontrado_xml:
         doc_origem_encontrado_xml = xped
@@ -254,7 +356,6 @@ def extrair_xml(caminho_xml: Path):
         imposto = det.find("nfe:imposto", NS)
         if prod is None:
             continue
-
         itens.append({
             "arquivo_xml": caminho_xml.name,
             "numero_nota": numero_nota,
@@ -270,7 +371,6 @@ def extrair_xml(caminho_xml: Path):
             "ipi_aliquota_item_xml": texto_xml(imposto, "nfe:IPI/nfe:IPITrib/nfe:pIPI") if imposto is not None else "",
             "ipi_valor_item_xml": texto_xml(imposto, "nfe:IPI/nfe:IPITrib/nfe:vIPI") if imposto is not None else "",
         })
-
     return cabecalho, itens
 
 # =========================================================
@@ -279,20 +379,17 @@ def extrair_xml(caminho_xml: Path):
 def limpar_texto_extraido(texto: str) -> str:
     if not texto:
         return ""
-
     texto = texto.replace("\x00", "")
     texto = texto.replace("\r\n", "\n").replace("\r", "\n")
-    texto = "".join(
-        ch for ch in texto
-        if ch == "\n" or ch == "\t" or ord(ch) >= 32
-    )
+    texto = "".join(ch for ch in texto if ch == "\n" or ch == "\t" or ord(ch) >= 32)
     return texto
+
 
 def converter_doc_word_para_txt(caminho_doc: Path) -> str:
     try:
         import win32com.client
     except Exception as e:
-        raise ValueError("pywin32 não está instalado. Rode: py -m pip install pywin32") from e
+        raise ValueError("pywin32 nao esta instalado. Rode: py -m pip install pywin32") from e
 
     caminho_doc_abs = str(caminho_doc.resolve())
     caminho_txt = PASTA_RESULTADO / f"_convertido_{caminho_doc.stem}.txt"
@@ -300,47 +397,34 @@ def converter_doc_word_para_txt(caminho_doc: Path) -> str:
 
     word = None
     doc = None
-
     try:
         word = win32com.client.Dispatch("Word.Application")
         word.Visible = False
-
-        doc = word.Documents.Open(
-            caminho_doc_abs,
-            ReadOnly=True,
-            ConfirmConversions=False,
-            AddToRecentFiles=False
-        )
-
-        doc.SaveAs2(caminho_txt_abs, FileFormat=2)  # wdFormatText
+        doc = word.Documents.Open(caminho_doc_abs, ReadOnly=True, ConfirmConversions=False, AddToRecentFiles=False)
+        doc.SaveAs2(caminho_txt_abs, FileFormat=2)
         doc.Close(False)
         word.Quit()
-
         texto = caminho_txt.read_text(encoding="cp1252", errors="ignore")
         return limpar_texto_extraido(texto)
-
     except Exception as e:
         try:
             if doc is not None:
                 doc.Close(False)
         except Exception:
             pass
-
         try:
             if word is not None:
                 word.Quit()
         except Exception:
             pass
-
         raise ValueError(f"Falha ao converter DOC pelo Word: {e}")
+
 
 def ler_doc_texto(caminho_doc: Path) -> str:
     if arquivo_vazio(caminho_doc):
         raise ValueError("Arquivo DOC/TXT da OC vazio ou inexistente")
-
     ext = caminho_doc.suffix.lower()
     texto = ""
-
     if ext in [".doc", ".docx"]:
         texto = converter_doc_word_para_txt(caminho_doc)
     else:
@@ -353,21 +437,18 @@ def ler_doc_texto(caminho_doc: Path) -> str:
                     texto = candidato
             except Exception:
                 pass
-
     if not texto.strip():
-        raise ValueError(f"Não foi possível extrair texto útil de {caminho_doc.name}")
-
+        raise ValueError(f"Nao foi possivel extrair texto util de {caminho_doc.name}")
     try:
         (PASTA_RESULTADO / f"debug_texto_lido_{caminho_doc.stem}.txt").write_text(texto, encoding="utf-8")
     except Exception:
         pass
-
     return texto
+
 
 def extrair_cabecalho_oc_doc(caminho_doc: Path):
     texto = ler_doc_texto(caminho_doc)
     texto_flat = normalize_spaces(texto)
-
     numero_oc = buscar_regex(texto_flat, r"ORDEM\s+DE\s+COMPRA\s+(\d+)", default="")
     if not numero_oc:
         numero_oc = buscar_regex(texto_flat, r"Pedido\s*:\s*(\d+)", default="")
@@ -376,43 +457,13 @@ def extrair_cabecalho_oc_doc(caminho_doc: Path):
     pedido = buscar_regex(texto_flat, r"Pedido\s*:\s*(\d+)", default="")
     data_pedido = buscar_regex(texto_flat, r"Data\s*:\s*(\d{2}/\d{2}/\d{4})", default="")
     prazo_entrega = buscar_regex(texto_flat, r"PRAZO\s+DE\s+ENTREGA\s*:\s*(\d{2}/\d{2}/\d{4})", default="")
-
-    cliente_cnpj = limpar_cnpj(buscar_regex(
-        texto_flat, r"C\.N\.P\.J\.?\s*:\s*([0-9\.\-/]+)", default=""
-    ))
-
-    cliente_nome = buscar_regex(
-        texto_flat,
-        r"Doc\.?\s*Origem\s*:\s*\d+\s+(.+?)\s+Pedido\s*:",
-        default=""
-    )
-
-    endereco_principal = buscar_regex(
-        texto_flat,
-        r"Pedido\s*:\s*\d+\s+(.+?)\s+Data\s*:",
-        default=""
-    )
-
-    endereco_entrega = buscar_regex(
-        texto_flat,
-        r"LOCAL\s+ENTREGA\s*:\s*(.+?)\s+LOCAL\s+COBRANÇA",
-        default=""
-    )
-
-    fornecedor_nome = buscar_regex(
-        texto_flat,
-        r"Fornecedor\s*:\s*\d+\s*-\s*(.+?)\s+Endereço\s*:",
-        default=""
-    )
-
-    fornecedor_cnpj = limpar_cnpj(buscar_regex(
-        texto_flat, r"CNPJ\s*:\s*([0-9\.\-/]+)", default=""
-    ))
-
-    valor_total_pedido = numero(buscar_regex(
-        texto_flat, r"Valor\s+do\s+Pedido\s*:\s*([0-9\.,]+)", default=""
-    ))
-
+    cliente_cnpj = limpar_cnpj(buscar_regex(texto_flat, r"C\.N\.P\.J\.?\s*:\s*([0-9\.\-/]+)", default=""))
+    cliente_nome = buscar_regex(texto_flat, r"Doc\.?\s*Origem\s*:\s*\d+\s+(.+?)\s+Pedido\s*:", default="")
+    endereco_principal = buscar_regex(texto_flat, r"Pedido\s*:\s*\d+\s+(.+?)\s+Data\s*:", default="")
+    endereco_entrega = buscar_regex(texto_flat, r"LOCAL\s+ENTREGA\s*:\s*(.+?)\s+LOCAL\s+COBRANÇA", default="")
+    fornecedor_nome = buscar_regex(texto_flat, r"Fornecedor\s*:\s*\d+\s*-\s*(.+?)\s+Endereço\s*:", default="")
+    fornecedor_cnpj = limpar_cnpj(buscar_regex(texto_flat, r"CNPJ\s*:\s*([0-9\.\-/]+)", default=""))
+    valor_total_pedido = numero(buscar_regex(texto_flat, r"Valor\s+do\s+Pedido\s*:\s*([0-9\.,]+)", default=""))
     return {
         "arquivo_oc_doc": caminho_doc.name,
         "numero_oc": numero_oc,
@@ -432,35 +483,29 @@ def extrair_cabecalho_oc_doc(caminho_doc: Path):
         "texto_extraido_doc_preview": texto_flat[:500],
     }
 
+
 def extrair_itens_oc_doc(caminho_doc: Path) -> pd.DataFrame:
     texto = ler_doc_texto(caminho_doc)
     linhas = [linha.rstrip() for linha in texto.splitlines()]
     registros = []
     item_atual = None
-
     for linha in linhas:
         limpa = normalize_spaces(linha)
         if not limpa:
             continue
-
         partes = [p.strip() for p in linha.split("\t") if p.strip()]
-
-        # formato tabulado esperado no DOC exportado
         if partes and re.fullmatch(r"\d{5,6}", partes[0]):
             if item_atual:
                 registros.append(item_atual)
-
             codigo_item_oc = partes[0]
             descricao_item_oc = partes[1] if len(partes) > 1 else ""
             unidade_item_oc = partes[2] if len(partes) > 2 else ""
             embalagem_item_oc = numero(partes[3]) if len(partes) > 3 else 0.0
             quantidade_item_oc = numero(partes[4]) if len(partes) > 4 else 0.0
-
             valor_unitario_item_oc = 0.0
             desconto_item_oc = 0.0
             ipi_item_oc = 0.0
             valor_total_item_oc = 0.0
-
             if len(partes) > 5:
                 moedas = re.findall(r"\d+[.,]\d{2}", partes[5])
                 if len(moedas) >= 1:
@@ -469,10 +514,8 @@ def extrair_itens_oc_doc(caminho_doc: Path) -> pd.DataFrame:
                     desconto_item_oc = numero(moedas[1])
                 if len(moedas) >= 3:
                     ipi_item_oc = numero(moedas[2])
-
             if len(partes) > 6:
                 valor_total_item_oc = numero(partes[6])
-
             item_atual = {
                 "arquivo_oc_doc": caminho_doc.name,
                 "codigo_item_oc": str(codigo_item_oc).strip(),
@@ -487,236 +530,319 @@ def extrair_itens_oc_doc(caminho_doc: Path) -> pd.DataFrame:
                 "metodo_extracao": "doc_tabulado",
             }
             continue
-
         if item_atual:
             texto_linha = limpa.upper()
-
-            fim_item = any(x in texto_linha for x in [
-                "VALOR DO PEDIDO",
-                "CONDIÇÕES DE PAGAMENTO",
-                "SETOR SOLICITANTE",
-                "DGS BRASIL",
-                "PÁGINA ",
-                "----",
-            ])
-
-            cabecalho_tabela = any(x in texto_linha for x in [
-                "REF.MAT",
-                "UN.COMP",
-                "QTD.PEDIDA",
-                "VALOR UNIT",
-                "CÓDIGO",
-                "DESCRIÇÃO DO ITEM",
-                "FABRICANTE",
-            ])
-
+            fim_item = any(x in texto_linha for x in ["VALOR DO PEDIDO", "CONDIÇÕES DE PAGAMENTO", "SETOR SOLICITANTE", "DGS BRASIL", "PÁGINA ", "----"])
+            cabecalho_tabela = any(x in texto_linha for x in ["REF.MAT", "UN.COMP", "QTD.PEDIDA", "VALOR UNIT", "CÓDIGO", "DESCRIÇÃO DO ITEM", "FABRICANTE"])
             if not fim_item and not cabecalho_tabela:
-                item_atual["descricao_item_oc"] = normalize_spaces(
-                    item_atual.get("descricao_item_oc", "") + " " + limpa
-                )
-
+                item_atual["descricao_item_oc"] = normalize_spaces(item_atual.get("descricao_item_oc", "") + " " + limpa)
     if item_atual:
         registros.append(item_atual)
-
     if not registros:
         try:
             (PASTA_RESULTADO / f"debug_itens_{caminho_doc.stem}.txt").write_text(texto, encoding="utf-8")
         except Exception:
             pass
-
     return pd.DataFrame(registros)
 
 # =========================================================
-# REGRAS DE ITEM
+# COMPARAÇÃO INTELIGENTE DE ITENS (XML x OC)
 # =========================================================
-def limpar_descricao(desc):
-    stopwords = {
-        "DE", "DA", "DO", "DAS", "DOS", "COM", "PARA", "EM",
-        "LTDA", "SIMPLES", "UNIDADE", "UN"
-    }
-    palavras = normalizar_texto(desc).split()
-    return " ".join([p for p in palavras if p not in stopwords])
-
-def comparar_descricao_inteligente(a, b):
-    p1 = set(limpar_descricao(a).split())
-    p2 = set(limpar_descricao(b).split())
-    if not p1 or not p2:
-        return False
-    inter = p1 & p2
-    # threshold simples e seguro
-    return len(inter) >= 2
-
 def extrair_fator(descricao):
-    """
-    Extrai fator de expressões tipo 2X8, 10X50.
-    Não captura coisas como 10FRX45CM, pois ali não há número x número "isolado".
+    """Detecta padrões de embalagem tipo 2X8, 10X50 na descrição.
+
+    Agora é usado apenas como informação auxiliar/auditoria — NÃO
+    sobrescreve mais a quantidade fiscal do XML, que é a fonte de
+    verdade (a versão anterior fazia `qtd_xml = fator`, o que podia
+    substituir uma quantidade correta por um número extraído de forma
+    heurística da descrição).
     """
     desc = str(descricao or "").upper()
     m = re.search(r"\b(\d{1,3})\s*[Xx]\s*(\d{1,3})\b", desc)
     if not m:
         return None
-    a = int(m.group(1))
-    b = int(m.group(2))
-    return a * b
+    return int(m.group(1)) * int(m.group(2))
+
+
+def calcular_similaridade_descricao(desc_xml_norm: str, desc_oc_norm: str) -> float:
+    """Score contínuo (0-1) de quão parecidas são duas descrições já
+    normalizadas. Combina:
+    - Jaccard de tokens relevantes (ignorando stopwords de item);
+    - razão de similaridade de sequência (difflib), que capta
+      proximidade mesmo quando o vocabulário difere um pouco.
+    Contenção direta (uma descrição contida na outra) tem peso extra,
+    pois é um sinal muito forte de correspondência.
+    """
+    if not desc_xml_norm or not desc_oc_norm:
+        return 0.0
+
+    tokens_xml = {t for t in desc_xml_norm.split() if t not in STOPWORDS_DESC and len(t) > 1}
+    tokens_oc = {t for t in desc_oc_norm.split() if t not in STOPWORDS_DESC and len(t) > 1}
+
+    if not tokens_xml or not tokens_oc:
+        jaccard = 0.0
+    else:
+        intersecao = tokens_xml & tokens_oc
+        uniao = tokens_xml | tokens_oc
+        jaccard = len(intersecao) / len(uniao) if uniao else 0.0
+
+    seq_ratio = SequenceMatcher(None, desc_xml_norm, desc_oc_norm).ratio()
+    score = (jaccard * 0.6) + (seq_ratio * 0.4)
+
+    if desc_xml_norm in desc_oc_norm or desc_oc_norm in desc_xml_norm:
+        score = max(score, 0.85)
+
+    return round(score, 4)
+
 
 def consolidar_itens_xml(xml_itens: list) -> list:
-    """
-    Consolida linhas repetidas da NF por código + descrição normalizada.
-    Ex.: SLIP3515S aparece duas vezes na NF do teu caso; aqui vira 1 só consolidado.
+    """Agrupa linhas repetidas do XML pelo mesmo item (código
+    normalizado + descrição normalizada), somando quantidade e valor.
     """
     mapa = {}
-
+    ordem = []
     for item in xml_itens:
         codigo = str(item.get("codigo_item_xml", "") or "").strip()
         descricao = str(item.get("descricao_item_xml", "") or "")
-        chave = (codigo, limpar_descricao(descricao))
-
+        chave = (normalizar_codigo(codigo), normalizar_desc(descricao))
         if chave not in mapa:
             mapa[chave] = dict(item)
+            ordem.append(chave)
         else:
             mapa[chave]["quantidade_item_xml"] = numero(mapa[chave].get("quantidade_item_xml", 0)) + numero(item.get("quantidade_item_xml", 0))
             mapa[chave]["valor_total_item_xml"] = numero(mapa[chave].get("valor_total_item_xml", 0)) + numero(item.get("valor_total_item_xml", 0))
+    return [mapa[chave] for chave in ordem]
 
-    return list(mapa.values())
 
-def encontrar_item_oc_para_nf(item_xml: dict, df_oc: pd.DataFrame):
-    """
-    Estratégia de match:
-    1) código exato
-    2) código da NF dentro da descrição da OC
-    3) código da OC dentro da descrição da NF
-    4) descrição inteligente
-    """
+def indexar_itens_oc(df_oc: pd.DataFrame) -> list:
+    """Pré-processa os itens da OC uma única vez (código/descrição
+    normalizados), evitando reprocessar texto a cada item do XML."""
+    indice = []
     if df_oc is None or df_oc.empty:
-        return None, "OC_SEM_ITENS"
+        return indice
+    for pos, row in enumerate(df_oc.to_dict(orient="records")):
+        codigo = str(row.get("codigo_item_oc", "")).strip()
+        descricao = str(row.get("descricao_item_oc", ""))
+        qtd = numero(row.get("quantidade_item_oc", 0))
+        indice.append({
+            "pos": pos,
+            "codigo": codigo,
+            "codigo_norm": normalizar_codigo(codigo),
+            "descricao": descricao,
+            
+            "descricao_norm": normalizar_desc(descricao),
+            "descricao_codigo_norm": normalizar_codigo(descricao),
 
-    codigo_xml = str(item_xml.get("codigo_item_xml", "") or "").strip()
-    desc_xml = str(item_xml.get("descricao_item_xml", "") or "")
+            "unidade": str(row.get("unidade_item_oc", "")),
+            "valor_unitario": numero(row.get("valor_unitario_item_oc", 0)),
+            "valor_total": numero(row.get("valor_total_item_oc", 0)),
+            "quantidade_total": qtd,
+            "quantidade_disponivel": qtd,
+        })
+    return indice
+
+
+def localizar_item_oc(item_xml: dict, indice_oc: list):
+    """Busca o item da OC correspondente a um item do XML.
+
+    Diferente da versão anterior (que percorria as linhas da OC e, em
+    cada linha, testava as 5 regras em sequência — o que fazia o
+    primeiro item da planilha "ganhar" mesmo quando não era o melhor
+    match), aqui cada critério de prioridade é testado contra TODOS os
+    itens da OC antes de passar para o próximo critério. Isso garante
+    que "código exato" sempre vença "match por descrição", não importa
+    a ordem das linhas na OC.
+
+    Itens da OC com saldo já consumido por outra linha do XML (relevante
+    quando duas descrições diferentes disputam a mesma linha da OC no
+    match por descrição) são preteridos, mas continuam elegíveis se não
+    houver alternativa — ficando marcados via score/õmétodo para auditoria.
+    """
+    codigo_xml = str(item_xml.get("codigo_item_xml", "")).strip()
+    codigo_xml_norm = normalizar_codigo(codigo_xml)
+    desc_xml = str(item_xml.get("descricao_item_xml", ""))
+    desc_xml_norm = normalizar_desc(desc_xml)
+
+    disponiveis = [c for c in indice_oc if c["quantidade_disponivel"] > 1e-6]
+    pool = disponiveis if disponiveis else indice_oc
 
     # 1) código exato
-    match = df_oc[df_oc["codigo_item_oc"].astype(str).str.strip() == codigo_xml]
-    if not match.empty:
-        return match.iloc[0], "MATCH_CODIGO_EXATO"
+    for c in pool:
+        if codigo_xml and codigo_xml == c["codigo"]:
+            return c, "COD_EXATO", 1.0
 
-    # 2) código XML dentro da descrição da OC
-    candidatos = df_oc[
-        df_oc["descricao_item_oc"].astype(str).str.upper().str.contains(re.escape(codigo_xml), na=False)
-    ]
-    if not candidatos.empty:
-        return candidatos.iloc[0], "MATCH_CODIGO_EM_DESCRICAO_OC"
+    # 2) código do XML dentro da descrição da OC
+    for c in pool:
+        if codigo_xml and codigo_xml in c["descricao"]:
+            return c, "COD_EM_DESC", 0.95
 
-    # 3) descrição da NF contém código da OC
-    for _, row in df_oc.iterrows():
-        cod_oc = str(row.get("codigo_item_oc", "") or "").strip()
-        if cod_oc and cod_oc in desc_xml:
-            return row, "MATCH_CODIGO_OC_EM_DESCRICAO_NF"
+    # 3) código relaxado (sem hífen/espaço/símbolo)
+    for c in pool:
+        if codigo_xml_norm and codigo_xml_norm == c["codigo_norm"]:
+            return c, "COD_RELAXADO", 0.9
+    for c in pool:
+        
+        if codigo_xml_norm and codigo_xml_norm in c["descricao_codigo_norm"]:
+            return c, "COD_RELAXADO_EM_DESC", 0.85
 
-    # 4) descrição inteligente
-    for _, row in df_oc.iterrows():
-        if comparar_descricao_inteligente(desc_xml, row.get("descricao_item_oc", "")):
-            return row, "MATCH_DESCRICAO_INTELIGENTE"
 
-    return None, "ITEM_NAO_ENCONTRADO"
+    # 4) código da OC dentro da descrição da NF (fallback adicional)
+    for c in pool:
+        if c["codigo"] and c["codigo"] in desc_xml:
+            return c, "COD_OC_EM_XML", 0.8
 
-def comparar_itens(xml_itens: list, df_oc_itens: pd.DataFrame):
-    """
-    Regra correta:
-    - Todo item da NF precisa existir na OC
-    - A OC pode ter mais itens que a NF
-    - Recebimento parcial é permitido: qtd_nf <= qtd_oc
-    """
-    relatorio = []
+    # 5) descrição inteligente — escolhe o MELHOR candidato, não o primeiro
+    melhor, melhor_score = None, 0.0
+    for c in pool:
+        score = calcular_similaridade_descricao(desc_xml_norm, c["descricao_norm"])
+        tokens_comuns = len(set(desc_xml_norm.split()) & set(c["descricao_norm"].split()))
+        contido = desc_xml_norm in c["descricao_norm"] or c["descricao_norm"] in desc_xml_norm
+        if score >= LIMIAR_SIMILARIDADE_DESC and (tokens_comuns >= MIN_TOKENS_COMUNS or contido):
+            if score > melhor_score:
+                melhor, melhor_score = c, score
+    if melhor is not None:
+        return melhor, "DESC_MATCH", melhor_score
+
+    # Último recurso: código exato bate, mas só em item já esgotado por
+    # outra linha do XML — ainda é o item certo, só registramos o alerta.
+    if disponiveis != indice_oc:
+        for c in indice_oc:
+            if codigo_xml and codigo_xml == c["codigo"]:
+                return c, "COD_EXATO_ITEM_OC_ESGOTADO", 1.0
+
+    return None, "NAO_ENCONTRADO", 0.0
+
+
+def avaliar_itens(xml_itens: list, df_oc: pd.DataFrame) -> dict:
+    erro_critico = False
     itens_ok = 0
     itens_erro = 0
+    motivos = []
+    detalhes = []
 
-    if df_oc_itens is None or df_oc_itens.empty:
-        for item in xml_itens:
-            relatorio.append({
-                "codigo_item_xml": item.get("codigo_item_xml", ""),
-                "descricao_item_xml": item.get("descricao_item_xml", ""),
-                "status_item": "ERRO",
-                "motivo_item": "OC_SEM_ITENS",
-                "metodo_match": ""
-            })
-        return relatorio, 0, len(xml_itens)
+    itens_consolidados = consolidar_itens_xml(xml_itens)
 
-    xml_itens = consolidar_itens_xml(xml_itens)
+    if df_oc is None or df_oc.empty:
+        return {
+            "erro_critico": True,
+            "itens_ok": 0,
+            "itens_erro": len(itens_consolidados),
+            "motivos": ["OC_SEM_ITENS"],
+            "detalhes": [],
+        }
 
-    for item_xml in xml_itens:
-        codigo_xml = str(item_xml.get("codigo_item_xml", "") or "").strip()
-        desc_xml = str(item_xml.get("descricao_item_xml", "") or "")
-        qtd_xml_original = numero(item_xml.get("quantidade_item_xml", 0))
-        vl_unit_xml = numero(item_xml.get("valor_unitario_item_xml", 0))
-        vl_total_xml = numero(item_xml.get("valor_total_item_xml", 0))
+    indice_oc = indexar_itens_oc(df_oc)
 
+    for item in itens_consolidados:
+        codigo_xml = str(item.get("codigo_item_xml", "")).strip()
+        desc_xml = str(item.get("descricao_item_xml", ""))
+        qtd_xml = numero(item.get("quantidade_item_xml", 0))
+        vl_unit_xml = numero(item.get("valor_unitario_item_xml", 0))
+        vl_total_xml = numero(item.get("valor_total_item_xml", 0))
+        unidade_xml = str(item.get("unidade_item_xml", ""))
         fator = extrair_fator(desc_xml)
-        qtd_xml_ajustada = fator if fator else qtd_xml_original
 
-        item_oc, metodo = encontrar_item_oc_para_nf(item_xml, df_oc_itens)
-        motivos = []
+        match, metodo, score = localizar_item_oc(item, indice_oc)
+        item_motivos = []
 
-        if item_oc is None:
-            motivos.append("ITEM_NAO_ENCONTRADO")
-            status = "ERRO"
-        else:
-            qtd_oc = numero(item_oc.get("quantidade_item_oc", 0))
-            vl_unit_oc = numero(item_oc.get("valor_unitario_item_oc", 0))
-            vl_total_oc = numero(item_oc.get("valor_total_item_oc", 0))
-            embalagem_oc = numero(item_oc.get("embalagem_item_oc", 0))
-            unidade_xml = normalizar_texto(item_xml.get("unidade_item_xml", ""))
-            unidade_oc = normalizar_texto(item_oc.get("unidade_item_oc", ""))
-
-            # Quantidade: NF pode ser parcial, então <= OC
-            if qtd_xml_ajustada > qtd_oc + 0.01:
-                # tenta regra simples com embalagem/fator da OC
-                convertido = qtd_oc * embalagem_oc if embalagem_oc and embalagem_oc > 1 else qtd_oc
-                if qtd_xml_ajustada > convertido + 0.01:
-                    motivos.append("QTD_ACIMA_DA_OC")
-
-            # Unidade: informativo, não mata sozinho
-            if unidade_xml and unidade_oc and unidade_xml != unidade_oc:
-                motivos.append("UNIDADE_DIVERGENTE")
-
-            # Valor unitário: tolerância
-            if vl_unit_oc > 0 and abs(vl_unit_xml - vl_unit_oc) > 0.05:
-                motivos.append("VALOR_UNITARIO_DIVERGENTE")
-
-            # Valor total do item na NF não pode estourar o valor do item correspondente na OC
-            if vl_total_oc > 0 and vl_total_xml > vl_total_oc + 0.05:
-                motivos.append("VALOR_TOTAL_ACIMA_DA_OC")
-
-            status = "OK" if not any(m for m in motivos if m not in {"UNIDADE_DIVERGENTE"}) else "ERRO"
-
-        if status == "OK":
-            itens_ok += 1
-        else:
+        if match is None:
+            erro_critico = True
             itens_erro += 1
+            item_motivos.append("ITEM_NAO_ENCONTRADO")
+            motivos.append(f"{codigo_xml}|ITEM_NAO_ENCONTRADO")
+            detalhes.append({
+                "codigo_item_xml": codigo_xml,
+                "descricao_item_xml": desc_xml,
+                "status_item": "ERRO",
+                "motivo_item": "ITEM_NAO_ENCONTRADO",
+                "metodo_match": metodo,
+                "score_match": 0.0,
+                "quantidade_item_xml": qtd_xml,
+                "quantidade_item_oc": "",
+                "valor_unitario_item_xml": vl_unit_xml,
+                "valor_unitario_item_oc": "",
+            })
+            continue
 
-        relatorio.append({
+        qtd_oc = numero(match.get("quantidade_total", 0))
+        vl_unit_oc = numero(match.get("valor_unitario", 0))
+        vl_total_oc = numero(match.get("valor_total", 0))
+        unidade_oc = str(match.get("unidade", ""))
+
+        # baixa informativa de saldo (não altera a regra de qtd_xml x qtd_oc,
+        # que segue comparando com a quantidade total do item na OC)
+        match["quantidade_disponivel"] = max(0.0, match["quantidade_disponivel"] - qtd_xml)
+
+        # --- Quantidade ---
+        if qtd_xml > qtd_oc + TOL_QTD:
+            erro_critico = True
+            itens_erro += 1
+            item_motivos.append("QTD_ACIMA")
+            motivos.append(f"{codigo_xml}|QTD_ACIMA")
+        else:
+            itens_ok += 1
+
+        # --- Valor unitário ---
+        if abs(vl_unit_xml - vl_unit_oc) > TOL_VALOR:
+            item_motivos.append("VALOR_DIVERGENTE")
+            motivos.append(f"{codigo_xml}|VALOR_DIVERGENTE")
+
+        # --- Consistência de cálculo do item (qtd * vl_unit ~= vl_total) ---
+        vl_total_calculado = qtd_xml * vl_unit_xml
+        if vl_total_xml and abs(vl_total_xml - vl_total_calculado) > max(TOL_VALOR, vl_total_calculado * 0.01):
+            item_motivos.append("CALCULO_ITEM_INCONSISTENTE")
+            motivos.append(f"{codigo_xml}|CALCULO_ITEM_INCONSISTENTE")
+
+        # --- Valor faturado do item não deve superar indevidamente o item da OC ---
+        if vl_total_oc and vl_total_xml > vl_total_oc + TOL_VALOR:
+            item_motivos.append("VALOR_ITEM_ACIMA_OC")
+            motivos.append(f"{codigo_xml}|VALOR_ITEM_ACIMA_OC")
+
+        # --- Unidade ---
+        u_xml_norm = normalizar_unidade(unidade_xml)
+        u_oc_norm = normalizar_unidade(unidade_oc)
+        if u_xml_norm and u_oc_norm and u_xml_norm != u_oc_norm:
+            item_motivos.append("UNIDADE_DIVERGENTE")
+            motivos.append(f"{codigo_xml}|UNIDADE_DIVERGENTE")
+
+        # --- Fator de embalagem (informativo) ---
+        if fator:
+            item_motivos.append(f"FATOR_EMBALAGEM_DETECTADO:{fator}")
+
+        if metodo == "COD_EXATO_ITEM_OC_ESGOTADO":
+            item_motivos.append("OC_ITEM_JA_UTILIZADO_POR_OUTRA_LINHA")
+
+        status_item = "ERRO" if ("QTD_ACIMA" in item_motivos or "ITEM_NAO_ENCONTRADO" in item_motivos) else "OK"
+
+        detalhes.append({
             "codigo_item_xml": codigo_xml,
             "descricao_item_xml": desc_xml,
-            "quantidade_item_xml_original": qtd_xml_original,
-            "quantidade_item_xml_ajustada": qtd_xml_ajustada,
-            "fator_detectado": fator or "",
-            "status_item": status,
-            "motivo_item": "|".join(motivos),
+            "status_item": status_item,
+            "motivo_item": "|".join(item_motivos),
             "metodo_match": metodo,
+            "score_match": score,
+            "quantidade_item_xml": qtd_xml,
+            "quantidade_item_oc": qtd_oc,
+            "valor_unitario_item_xml": vl_unit_xml,
+            "valor_unitario_item_oc": vl_unit_oc,
         })
 
-    return relatorio, itens_ok, itens_erro
+    return {
+        "erro_critico": erro_critico,
+        "itens_ok": itens_ok,
+        "itens_erro": itens_erro,
+        "motivos": motivos,
+        "detalhes": detalhes,
+    }
 
 # =========================================================
 # PAREAMENTO
 # =========================================================
 def listar_arquivos():
     xmls = sorted(PASTA_XML.glob("*.xml"))
-    docs_oc = sorted(
-        list(PASTA_OC.glob("*.doc")) +
-        list(PASTA_OC.glob("*.docx")) +
-        list(PASTA_OC.glob("*.txt")) +
-        list(PASTA_OC.glob("*.csv"))
-    )
+    docs_oc = sorted(list(PASTA_OC.glob("*.doc")) + list(PASTA_OC.glob("*.docx")) + list(PASTA_OC.glob("*.txt")) + list(PASTA_OC.glob("*.csv")))
     return xmls, docs_oc
+
 
 def montar_pares():
     xmls, docs_oc = listar_arquivos()
@@ -729,16 +855,15 @@ def montar_pares():
         })
     return pares
 
+
 def mostrar_arquivos_encontrados():
     xmls, docs_oc = listar_arquivos()
-
     print("\nXML encontrados:")
     if xmls:
         for arq in xmls:
             print(f"- {arq.name} ({arq.stat().st_size} bytes)")
     else:
         print("- Nenhum XML encontrado")
-
     print("\nOCs DOC/TXT encontradas:")
     if docs_oc:
         for arq in docs_oc:
@@ -752,82 +877,67 @@ def mostrar_arquivos_encontrados():
 def conferir_prazo(data_emissao_str: str, prazo_entrega_str: str):
     de = parse_data(data_emissao_str)
     pe = parse_data(prazo_entrega_str)
-
     if not de or not pe:
         return {"data_limite_7_dias": "", "status_prazo": "NAO_AVALIADO"}
-
     limite = de + timedelta(days=7)
     status = "EM_DIA" if pe <= limite else "FORA_DO_PRAZO"
-    return {
-        "data_limite_7_dias": data_str(limite),
-        "status_prazo": status,
-    }
+    return {"data_limite_7_dias": data_str(limite), "status_prazo": status}
 
-def conferir_cabecalho(xml_head: dict, oc_head: dict, df_itens_oc: pd.DataFrame):
+
+def avaliar_cabecalho(xml_head, oc_head):
     motivos = []
+    erro_critico = False
 
-    # Regra principal: Doc Origem na NF
-    doc_origem_oc = str(oc_head.get("doc_origem", "") or "")
-    doc_origem_xml = str(xml_head.get("doc_origem_encontrado_xml", "") or "")
-    xped_xml = str(xml_head.get("xped_xml", "") or "")
+    doc_oc = so_numeros(oc_head.get("doc_origem", ""))
+    xped = so_numeros(xml_head.get("xped_xml", ""))
+    obs_nf = so_numeros(xml_head.get("observacao_nota", ""))
 
-    doc_ok = bool(doc_origem_oc) and (
-        doc_origem_oc == doc_origem_xml
-        or doc_origem_oc == xped_xml
-        or doc_origem_oc in str(xml_head.get("observacao_nota", ""))
-    )
+    doc_ok = (doc_oc == xped) or (doc_oc and doc_oc in obs_nf)
     if not doc_ok:
-        motivos.append("DOC_ORIGEM_NAO_REFERENCIADO")
+        erro_critico = True
+        motivos.append("DOC_ORIGEM")
 
-    # Fornecedor: raiz do CNPJ e nome normalizado/alias
-    forn_raiz_ok = raiz_cnpj(oc_head.get("fornecedor_cnpj", "")) == raiz_cnpj(xml_head.get("emitente_cnpj", ""))
-    forn_nome_ok = comparar_nome_fornecedor(
-        oc_head.get("fornecedor_nome", ""),
-        xml_head.get("emitente_nome", "")
+    raiz_nf = raiz_cnpj(xml_head.get("emitente_cnpj", ""))
+    raiz_oc = raiz_cnpj(oc_head.get("fornecedor_cnpj", ""))
+    if raiz_nf != raiz_oc:
+        erro_critico = True
+        motivos.append("CNPJ_RAIZ")
+    elif limpar_cnpj(xml_head.get("emitente_cnpj", "")) != limpar_cnpj(oc_head.get("fornecedor_cnpj", "")):
+        motivos.append("FILIAL")
+
+    
+    cliente_ok_texto = comparar_texto_simples(
+    oc_head.get("cliente_nome", ""),
+    xml_head.get("destinatario_nome", "")
     )
 
-    fornecedor_ok = forn_raiz_ok or forn_nome_ok
-    if not fornecedor_ok:
-        motivos.append("FORNECEDOR_DIVERGENTE")
+    cliente_ok_cnpj = raiz_cnpj(oc_head.get("cliente_cnpj", "")) == raiz_cnpj(xml_head.get("destinatario_cnpj", ""))
 
-    # Cliente / destinatário
-    cliente_ok = comparar_texto_simples(
-        oc_head.get("cliente_nome", ""),
-        xml_head.get("destinatario_nome", "")
-    )
-    cliente_cnpj_ok = raiz_cnpj(oc_head.get("cliente_cnpj", "")) == raiz_cnpj(xml_head.get("destinatario_cnpj", ""))
-    if not (cliente_ok or cliente_cnpj_ok):
-        motivos.append("CLIENTE_DIVERGENTE")
+    cliente_ok = cliente_ok_texto or cliente_ok_cnpj
 
-    # Endereço (informativo, não mata cabeçalho sozinho)
-    endereco_ok = comparar_texto_simples(
-        oc_head.get("endereco_entrega", ""),
-        xml_head.get("endereco_destinatario", "")
-    )
+    if not cliente_ok:
+        erro_critico = True
+        motivos.append("CLIENTE")
 
-    # Valor: NF parcial é permitida, então o total da NF deve ser <= total da OC
-    total_oc = numero(oc_head.get("valor_total_pedido", 0.0))
-    total_nf = numero(xml_head.get("valor_total_nota", 0.0))
-    valor_total_ok = (total_oc <= 0) or (total_nf <= total_oc + 0.05)
-    if not valor_total_ok:
-        motivos.append("VALOR_TOTAL_ACIMA_DA_OC")
+
+    valor_oc = numero(oc_head.get("valor_total_pedido", 0))
+    valor_nf = numero(xml_head.get("valor_total_nota", 0))
+    if abs(valor_nf - valor_oc) > TOL_VALOR:
+        if valor_nf > valor_oc:
+            erro_critico = True
+            motivos.append("VALOR_ACIMA")
+        else:
+            motivos.append("NF_PARCIAL")
 
     prazo = conferir_prazo(xml_head.get("data_emissao", ""), oc_head.get("prazo_entrega", ""))
 
-    status_geral = "APROVADA_CABECALHO" if not any(m in motivos for m in ["DOC_ORIGEM_NAO_REFERENCIADO", "FORNECEDOR_DIVERGENTE", "CLIENTE_DIVERGENTE", "VALOR_TOTAL_ACIMA_DA_OC"]) else "DIVERGENTE_CABECALHO"
-
     return {
-        **xml_head,
-        **oc_head,
-        "doc_origem_referenciado_na_obs": "SIM" if doc_ok else "NAO",
-        "fornecedor_ok": "SIM" if fornecedor_ok else "NAO",
-        "cliente_ok": "SIM" if (cliente_ok or cliente_cnpj_ok) else "NAO",
-        "endereco_ok": "SIM" if endereco_ok else "NAO",
-        "valor_total_ok": "SIM" if valor_total_ok else "NAO",
-        "data_limite_7_dias": prazo["data_limite_7_dias"],
+        "erro_critico": erro_critico,
+        "motivos": motivos,
         "status_prazo": prazo["status_prazo"],
-        "motivo_cabecalho": "|".join(motivos),
-        "status_geral_cabecalho": status_geral,
+        "data_limite_7_dias": prazo["data_limite_7_dias"],
+        "doc_origem_ok": doc_ok,
+        "cliente_ok": cliente_ok,
     }
 
 # =========================================================
@@ -847,7 +957,6 @@ def processar():
     logs = []
 
     pares = montar_pares()
-
     if not pares:
         print("\nNenhum arquivo encontrado para processar.")
         return
@@ -878,7 +987,6 @@ def processar():
         itens_xml = []
         df_itens_oc = pd.DataFrame()
 
-        # XML
         if arq_xml is not None:
             try:
                 xml_head, itens_xml = extrair_xml(arq_xml)
@@ -894,7 +1002,6 @@ def processar():
             log["status_xml"] = "NAO_ENCONTRADO"
             log["observacao"] += "Sem XML pareado | "
 
-        # OC
         if arq_oc_doc is not None:
             try:
                 oc_head = extrair_cabecalho_oc_doc(arq_oc_doc)
@@ -925,38 +1032,41 @@ def processar():
             log["status_oc_doc_itens"] = "NAO_ENCONTRADO"
             log["observacao"] += "Sem DOC/TXT de OC pareado | "
 
-        # Conferência
         if xml_head is not None and oc_head is not None:
             try:
-                conf = conferir_cabecalho(xml_head, oc_head, df_itens_oc)
-                conferencias_rows.append(conf)
-                log["status_conferencia_cabecalho"] = "OK"
+                cab = avaliar_cabecalho(xml_head, oc_head)
+                conferencias_rows.append({
+                    "numero_nota": xml_head.get("numero_nota", ""),
+                    "numero_oc": oc_head.get("numero_oc", ""),
+                    "status_cabecalho": "OK" if not cab["erro_critico"] else "ERRO",
+                    "motivo_cabecalho": "|".join(cab.get("motivos", [])),
+                    "status_prazo": cab.get("status_prazo", ""),
+                    "data_limite_7_dias": cab.get("data_limite_7_dias", ""),
+                })
 
-                rel_itens, itens_ok, itens_erro = comparar_itens(itens_xml, df_itens_oc)
-                status_itens = "OK" if itens_erro == 0 else "ERRO"
+                itens = avaliar_itens(itens_xml, df_itens_oc)
+                itens_ok = itens["itens_ok"]
+                itens_erro = itens["itens_erro"]
+                status_itens = "ERRO" if itens["erro_critico"] else "OK"
                 log["status_conferencia_itens"] = status_itens
 
-                for row in rel_itens:
+                for det in itens.get("detalhes", []):
                     conferencia_itens_rows.append({
                         "arquivo_xml": arq_xml.name,
                         "arquivo_oc_doc": arq_oc_doc.name,
                         "numero_nota": xml_head.get("numero_nota", ""),
                         "numero_oc": oc_head.get("numero_oc", ""),
-                        **row
+                        **det,
                     })
 
+                if cab["erro_critico"] or itens["erro_critico"]:
+                    status_final = "EMPRESTIMO"
+                else:
+                    status_final = "OK"
+
                 motivos = []
-                if conf["status_geral_cabecalho"] != "APROVADA_CABECALHO":
-                    if conf.get("motivo_cabecalho"):
-                        motivos.append(conf["motivo_cabecalho"])
-                    else:
-                        motivos.append("ERRO_CABECALHO")
-
-                if status_itens != "OK":
-                    motivos.append("ERRO_ITENS")
-
-                status_final = "OK" if not motivos else "ERRO"
-
+                motivos.extend(cab.get("motivos", []))
+                motivos.extend(itens.get("motivos", []))
                 data_programada = xml_head.get("data_programada_xml", "") or oc_head.get("prazo_entrega", "")
 
                 programacao_rows.append({
@@ -972,21 +1082,45 @@ def processar():
                     "valor_total": xml_head.get("valor_total_nota", 0),
                     "status": status_final,
                     "status_itens": status_itens,
-                    "status_cabecalho": conf.get("status_geral_cabecalho", ""),
-                    "motivo": "|".join([m for m in motivos if m]),
+                    "status_cabecalho": "OK" if not cab["erro_critico"] else "ERRO",
+                    "motivo": "|".join(motivos),
                     "responsavel": "OK" if status_final == "OK" else "EMPRESTIMO",
                 })
 
                 print(
-                    f"Conferencia | Cabeçalho: {conf['status_geral_cabecalho']} | "
+                    f"Conferencia | Cabecalho: {'OK' if not cab['erro_critico'] else 'ERRO'} | "
                     f"Itens: {status_itens} | Final: {status_final}"
                 )
-
             except Exception as e:
                 log["status_conferencia_cabecalho"] = "ERRO"
                 log["status_conferencia_itens"] = "ERRO"
                 log["observacao"] += f"Erro conferencia: {e} | "
                 print(f"Erro conferencia: {e}")
+
+        elif xml_head is not None and oc_head is None:
+            # Regra de negócio: sem OC vinculada, a NF é RECUSADA.
+            # A versão anterior deixava esse caso sem nenhuma linha de
+            # saída em programacao_recebimento — corrigido aqui.
+            log["status_conferencia_cabecalho"] = "RECUSADA_SEM_OC"
+            log["status_conferencia_itens"] = "NAO_AVALIADO"
+            programacao_rows.append({
+                "id": idx,
+                "data_programada": xml_head.get("data_programada_xml", ""),
+                "numero_nota": xml_head.get("numero_nota", ""),
+                "numero_oc": "",
+                "doc_origem": xml_head.get("doc_origem_encontrado_xml", ""),
+                "fornecedor": xml_head.get("emitente_nome", ""),
+                "qtd_itens": len(consolidar_itens_xml(itens_xml)),
+                "itens_ok": 0,
+                "itens_erro": 0,
+                "valor_total": xml_head.get("valor_total_nota", 0),
+                "status": "RECUSADA",
+                "status_itens": "NAO_AVALIADO",
+                "status_cabecalho": "NAO_AVALIADO",
+                "motivo": "OC_NAO_VINCULADA",
+                "responsavel": "RECUSADA",
+            })
+            print("Classificacao: RECUSADA (OC nao vinculada / nao encontrada)")
         else:
             log["status_conferencia_cabecalho"] = "NAO_REALIZADA"
             log["status_conferencia_itens"] = "NAO_REALIZADA"
@@ -994,7 +1128,6 @@ def processar():
         print()
         logs.append(log)
 
-    # DataFrames
     df_cab_xml = pd.DataFrame(cab_xml_rows)
     df_itens_xml = pd.DataFrame(itens_xml_rows)
     df_cab_oc = pd.DataFrame(cab_oc_rows)
@@ -1004,7 +1137,6 @@ def processar():
     df_prog = pd.DataFrame(programacao_rows)
     df_logs = pd.DataFrame(logs)
 
-    # Excel
     with pd.ExcelWriter(ARQUIVO_RESULTADO, engine="openpyxl") as writer:
         (df_cab_xml if not df_cab_xml.empty else pd.DataFrame(columns=["sem_dados"])).to_excel(writer, sheet_name="xml_cabecalho", index=False)
         (df_itens_xml if not df_itens_xml.empty else pd.DataFrame(columns=["sem_dados"])).to_excel(writer, sheet_name="xml_itens", index=False)
@@ -1015,7 +1147,6 @@ def processar():
         (df_prog if not df_prog.empty else pd.DataFrame(columns=["sem_dados"])).to_excel(writer, sheet_name="programacao", index=False)
         (df_logs if not df_logs.empty else pd.DataFrame(columns=["sem_dados"])).to_excel(writer, sheet_name="log_processamento", index=False)
 
-    # CSVs
     df_cab_xml.to_csv(PASTA_RESULTADO / "xml_cabecalho.csv", index=False, sep=";", encoding="utf-8-sig")
     df_itens_xml.to_csv(PASTA_RESULTADO / "xml_itens.csv", index=False, sep=";", encoding="utf-8-sig")
     df_cab_oc.to_csv(PASTA_RESULTADO / "oc_doc_cabecalho.csv", index=False, sep=";", encoding="utf-8-sig")
